@@ -53,7 +53,8 @@ static_assert(sizeof(SharedArenaHeader) <= kSharedArenaHeaderBytes);
 
 // A 2 MB-aligned reservation.  Large pages first, then the largest alignment the OS will give us for free.
 // A non-empty shared_file instead maps one file whose first 4 KiB identify the pack and whose remaining bytes
-// are the resident arena.  This shared-file layout is intended for tmpfs (/dev/shm); hugetlbfs would need
+// are the resident arena. CUDA registers shared expert weights as device-read-only so ordinary filesystems
+// such as ext4 work as well as tmpfs (/dev/shm). hugetlbfs would need
 // hugepage-aligned file size and arena offset rather than the 4 KiB header layout used here.
 void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::string& shared_file,
               uint64_t shared_pack_hash, void*& mapping_base, uint64_t& mapping_bytes) {
@@ -341,6 +342,30 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
     // Register with CUDA BEFORE any page is touched: cudaHostRegister pins what is resident now, and a region
     // that has already been faulted in page by page is far more expensive to register and may fail outright.
     if (base) {
+        unsigned int register_flags = cudaHostRegisterPortable | cudaHostRegisterMapped;
+#if defined(__linux__) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+        if (!shared_file.empty()) {
+            // Linux rejects long-term writable DMA pins on shared file mappings
+            // that need filesystem dirty tracking (e.g. ext4). Experts are only
+            // read by the GPU; CPU loaders still need the read/write mmap above.
+            // PORTABLE exposes the registration to every visible device, so
+            // require support on all of them before selecting this flag.
+            int devices = 0;
+            bool readonly = cudaGetDeviceCount(&devices) == cudaSuccess && devices > 0;
+            for (int gpu = 0; readonly && gpu < devices; ++gpu) {
+                int supported = 0;
+                readonly = cudaDeviceGetAttribute(&supported, cudaDevAttrHostRegisterReadOnlySupported, gpu) == cudaSuccess &&
+                           supported != 0;
+            }
+            if (readonly) {
+                register_flags |= cudaHostRegisterReadOnly;
+                note = "CUDA device-read-only registration; " + note;
+            } else {
+                (void) cudaGetLastError();
+                note = "CUDA device-read-only registration unavailable; " + note;
+            }
+        }
+#endif
         // #243: STRATA_ARENA_PIN_GIB=N caps the registration from the start where the caller set no cap
         const int env_gib = arena_pin_cap_gib();
         uint64_t cap = max_pinned_bytes;
@@ -351,7 +376,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
         }
         const bool capped = cap > 0 && cap < bytes && bounds.size() >= 2;
         const cudaError_t e = capped ? cudaSuccess :
-            cudaHostRegister(base, (size_t) bytes, cudaHostRegisterPortable | cudaHostRegisterMapped);
+            cudaHostRegister(base, (size_t) bytes, register_flags);
         if (!capped && e == cudaSuccess) {
             note = "cudaHostRegister PORTABLE ok; " + note;
             registered_bytes = bytes;
@@ -362,6 +387,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
             bool limited = capped;
             uint64_t limit = cap;
             std::string limit_why;
+            std::string slice_error;
 #ifdef _WIN32
             // #243 (opt-in, STRATA_ARENA_PIN_GIB=auto): not up to the driver's refusal but below the shared-memory
             // budget, for a PC where the full sliced pin leaves WDDM refusing later allocations.  Not the default: a
@@ -371,7 +397,10 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
             for (size_t i = 0; i + 1 < bounds.size(); ++i) {
                 const uint64_t off = bounds[i], n = bounds[i + 1] - bounds[i];
                 if (limited && (off > limit || n > limit - off)) break;
-                if (cudaHostRegister((uint8_t*) base + off, (size_t) n, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
+                const cudaError_t slice_result = cudaHostRegister((uint8_t*) base + off, (size_t) n, register_flags);
+                if (slice_result != cudaSuccess) {
+                    slice_error = "slice " + std::to_string(i) + " registration failed (" +
+                                  cudaGetErrorString(slice_result) + "); ";
                     (void) cudaGetLastError();
                     break;
                 }
@@ -386,7 +415,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
                              (limited ? "slices capped at " + std::string(gib) + " GiB (" + limit_why +
                                         "; STRATA_ARENA_PIN_GIB=auto; N sets a cap; #243); " : std::string())) +
                    std::to_string(registered_slices) + " slices pinned (" + std::to_string(registered_bytes >> 30) +
-                   " GiB); " + note;
+                   " GiB); " + slice_error + note;
             if (registered_bytes < bytes) {
                 const char* env = std::getenv("STRATA_ARENA_LOCK");
                 if (env == nullptr || std::string(env) != "0") {

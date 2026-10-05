@@ -836,8 +836,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
 
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(pinned_shared_test src/core/pinned_shared_test.cpp)
+    target_include_directories(pinned_shared_test PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(pinned_shared_test PRIVATE strata_core ${_strata_gpu_runtime_target})
     add_test(NAME pinned_shared_test COMMAND pinned_shared_test)
+    if(STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
+      # Use the build filesystem so an ext4 checkout exercises file-backed GUP,
+      # rather than silently testing only tmpfs on machines with /tmp in RAM.
+      add_test(NAME pinned_shared_cuda_test COMMAND pinned_shared_test --require-pinned ${CMAKE_CURRENT_BINARY_DIR})
+      set_tests_properties(pinned_shared_cuda_test PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
   endif()
 
   # Plan v0.3 P2: the n-gram table read straight from the SSD. The selftest needs only the CPU and a temp file.
