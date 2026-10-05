@@ -47,6 +47,8 @@ struct PinnedArena {
     /// followed by the end of the last one.  `slice_starts` holds the registered ones.
     /// `max_pinned_bytes`: optional cap on CUDA registration. 0 preserves the normal unrestricted path.
     /// `shared_file`: on Linux, use a file-backed MAP_SHARED mapping instead of anonymous memory.
+    /// CUDA registers shared weights as device-read-only when supported by all visible GPUs; CPU population
+    /// remains writable. GPU code must not write to a shared arena.
     /// `shared_pack_hash` identifies the pack that is allowed to populate that backing.  The file carries a
     /// small header and is refused when its stored hash does not match.  Empty `shared_file` preserves the
     /// existing allocation path.  Population/coordination and backing-file lifetime remain the caller's job.

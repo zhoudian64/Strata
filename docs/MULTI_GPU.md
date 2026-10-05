@@ -166,6 +166,12 @@ into the card that owns the layer.
   leaves WDDM refusing allocations); the rest streams through the pinned staging ring. A Linux driver has no such
   limit, so there the whole arena is pinned (since 0.1.31; the cap cost a 4090 + 3060 split two thirds of its
   prompt speed, #253). `STRATA_ARENA_PIN_GIB=N` pins at most N GiB, `0` the whole arena, on any OS.
+- On Linux, `--shared-expert-arena` registers shared weights as GPU-read-only when all visible CUDA devices
+  support it. CPU loaders can still populate the file. This permits an ext4 shared mapping to be pinned:
+  Linux rejects long-term writable DMA pins on file mappings that need filesystem dirty tracking. Both the
+  whole-arena and per-layer registration paths use this flag. Startup reports `CUDA device-read-only registration`
+  and whether registration succeeded; `mlock` is a separate fallback and raising its limit does not fix a CUDA
+  registration error. Devices without this capability and HIP retain their existing registration path.
 - Every card needs compute capability 7.5 (RTX 20 or newer). The pre-sm_80 QSA scorer path is fp32 FMAs, so a
   Turing card runs the same kernels instead of the tensor-core prompt attention.
 
